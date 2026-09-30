@@ -267,5 +267,190 @@ c = chain("S-PRIO")
 check("结论 invalid 且原因附待补证说明",
       c["status"] == "invalid" and any(x.startswith("另有待补证") for x in c["reasons"]), str(c["reasons"]))
 
+# ---------------------------------------------------------------- 15. 作废纠错
+print("15) 作废纠错：无效事件作废后按有效版本重算，留痕可查")
+reg("S-VOID", collector="张三", seal="SEAL-VD")
+ev({"event_id": "VD-T1", "event_type": "transfer", "sample_code": "S-VOID",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-VD",
+    "from_custodian": "张三", "to_custodian": "李四"})
+ev({"event_id": "VD-R1", "event_type": "receive", "sample_code": "S-VOID",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-VD",
+    "receiver": "李四", "seal_no": "WRONG-SEAL"})
+c = chain("S-VOID")
+check("错误签收导致 invalid", c["status"] == "invalid", str(c["reasons"]))
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-VD-1", "sample_code": "S-VOID", "action": "void",
+    "target_event_id": "VD-R1", "operator": "质管员", "reason": "签收封签号录入错误，作废后重报"})
+check("作废纠错 201", r.status_code == 201, r.text)
+check("纠错响应含重算结论", r.json()["evaluation"]["status"] == "pending", r.text)
+c = chain("S-VOID")
+check("作废后重算为 pending（无效原因消除）", c["status"] == "pending", str(c))
+check("时间线含被作废事件并标注纠错号",
+      any(e["event_id"] == "VD-R1" and e["status"] == "voided" and e["correction_id"] == "CORR-VD-1"
+          for e in c["timeline"]), str(c["timeline"]))
+check("纠错记录留痕（操作人/原因）",
+      any(x["correction_id"] == "CORR-VD-1" and x["action"] == "void"
+          and x["operator"] == "质管员" and x["target_event_id"] == "VD-R1"
+          for x in c["corrections"]), str(c.get("corrections")))
+# 被作废事件号永久占用：同内容重试仍幂等 200，且不会复活
+r = ev({"event_id": "VD-R1", "event_type": "receive", "sample_code": "S-VOID",
+        "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-VD",
+        "receiver": "李四", "seal_no": "WRONG-SEAL"})
+check("被作废事件同号同内容重试 200 幂等", r.status_code == 200 and r.json()["idempotent"] is True, r.text)
+check("被作废事件不复活", chain("S-VOID")["status"] == "pending")
+# 补录正确签收 + 入库 → valid
+ev({"event_id": "VD-R2", "event_type": "receive", "sample_code": "S-VOID",
+    "occurred_at": "2026-09-30T03:30:00Z", "transfer_no": "TR-VD",
+    "receiver": "李四", "seal_no": "SEAL-VD"})
+ev({"event_id": "VD-S1", "event_type": "storage", "sample_code": "S-VOID",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+c = chain("S-VOID")
+check("作废补录后重算 valid", c["status"] == "valid", str(c["reasons"]))
+
+# ---------------------------------------------------------------- 16. 替换纠错
+print("16) 替换纠错：新事件号取代原事件参与核验")
+reg("S-REPL", collector="张三", seal="SEAL-RP")
+ev({"event_id": "RP-T1", "event_type": "transfer", "sample_code": "S-REPL",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-RP",
+    "from_custodian": "张三", "to_custodian": "李四"})
+ev({"event_id": "RP-R1", "event_type": "receive", "sample_code": "S-REPL",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-RP",
+    "receiver": "王五", "seal_no": "SEAL-RP"})
+c = chain("S-REPL")
+check("接收人错误导致 invalid", c["status"] == "invalid", str(c["reasons"]))
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-RP-1", "sample_code": "S-REPL", "action": "replace",
+    "target_event_id": "RP-R1", "operator": "质管员", "reason": "签收人录入错误，替换为正确签收",
+    "new_event": {"event_id": "RP-R1B", "event_type": "receive",
+                  "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-RP",
+                  "receiver": "李四", "seal_no": "SEAL-RP"}})
+check("替换纠错 201 且返回新事件号",
+      r.status_code == 201 and r.json()["correction"]["new_event_id"] == "RP-R1B", r.text)
+c = chain("S-REPL")
+check("替换后 invalid 消除（仅缺入库 pending）",
+      c["status"] == "pending" and any("缺少实验室入库" in x for x in c["reasons"]), str(c))
+check("原事件标记 replaced 并留痕纠错号",
+      any(e["event_id"] == "RP-R1" and e["status"] == "replaced" and e["correction_id"] == "CORR-RP-1"
+          for e in c["timeline"]), str(c["timeline"]))
+check("新事件 active 参与核验",
+      any(e["event_id"] == "RP-R1B" and e["status"] == "active" for e in c["timeline"]), str(c["timeline"]))
+check("纠错记录含新事件号", c["corrections"][0]["new_event_id"] == "RP-R1B", str(c["corrections"]))
+check("当前保管人按新事件重算为李四", c["current_custodian"] == "李四", str(c["current_custodian"]))
+ev({"event_id": "RP-S1", "event_type": "storage", "sample_code": "S-REPL",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+check("补入库后 valid", chain("S-REPL")["status"] == "valid")
+
+# ---------------------------------------------------------------- 17. 纠错幂等/冲突/边界
+print("17) 纠错幂等、异内容冲突、跨样本、非有效版本、占用新号")
+same = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-RP-1", "sample_code": "S-REPL", "action": "replace",
+    "target_event_id": "RP-R1", "operator": "质管员", "reason": "签收人录入错误，替换为正确签收",
+    "new_event": {"event_id": "RP-R1B", "event_type": "receive",
+                  "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-RP",
+                  "receiver": "李四", "seal_no": "SEAL-RP"}})
+check("同纠错号同内容重试 200 幂等", same.status_code == 200 and same.json()["idempotent"] is True, same.text)
+diff = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-RP-1", "sample_code": "S-REPL", "action": "void",
+    "target_event_id": "RP-R1", "operator": "质管员", "reason": "改动内容"})
+check("同纠错号异内容 409 correction_conflict",
+      diff.status_code == 409 and diff.json()["error"]["code"] == "correction_conflict", diff.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-X-1", "sample_code": "S-REPL", "action": "void",
+    "target_event_id": "VD-T1", "operator": "质管员", "reason": "跨样本"})
+check("跨样本纠错 409 cross_sample_correction",
+      r.status_code == 409 and r.json()["error"]["code"] == "cross_sample_correction", r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-X-2", "sample_code": "S-REPL", "action": "void",
+    "target_event_id": "RP-R1", "operator": "质管员", "reason": "重复纠错已被替换事件"})
+check("非当前有效版本 409 event_not_active",
+      r.status_code == 409 and r.json()["error"]["code"] == "event_not_active", r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-X-3", "sample_code": "S-REPL", "action": "void",
+    "target_event_id": "NOPE", "operator": "质管员", "reason": "目标不存在"})
+check("目标事件不存在 404 event_not_found",
+      r.status_code == 404 and r.json()["error"]["code"] == "event_not_found", r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-X-4", "sample_code": "S-REPL", "action": "replace",
+    "target_event_id": "RP-T1", "operator": "质管员", "reason": "新号占用",
+    "new_event": {"event_id": "VD-R1", "event_type": "transfer",
+                  "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-RP",
+                  "from_custodian": "张三", "to_custodian": "李四"}})
+check("新事件号被占用（含他样本已作废号）409 event_conflict",
+      r.status_code == 409 and r.json()["error"]["code"] == "event_conflict", r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-X-5", "sample_code": "S-REPL", "action": "replace",
+    "target_event_id": "RP-T1", "operator": "质管员", "reason": "缺新事件内容"})
+check("replace 缺 new_event 422", r.status_code == 422, r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-X-6", "sample_code": "S-REPL", "action": "void",
+    "target_event_id": "RP-T1", "operator": "质管员", "reason": "void 带新事件",
+    "new_event": {"event_id": "RP-T1B", "event_type": "transfer",
+                  "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-RP",
+                  "from_custodian": "张三", "to_custodian": "李四"}})
+check("void 携带 new_event 422", r.status_code == 422, r.text)
+check("失败纠错不留痕", len(chain("S-REPL")["corrections"]) == 1, str(chain("S-REPL")["corrections"]))
+
+# ---------------------------------------------------------------- 18. 并发纠错同一有效版本
+print("18) 并发针对同一有效版本仅一次成功，失败不改链")
+import threading  # noqa: E402
+
+reg("S-CONC", collector="张三", seal="SEAL-CC")
+ev({"event_id": "CC-T1", "event_type": "transfer", "sample_code": "S-CONC",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-CC",
+    "from_custodian": "张三", "to_custodian": "李四"})
+results: list[int] = []
+
+
+def _worker(i: int) -> None:
+    c2 = TestClient(app)
+    rr = c2.post(f"{API}/corrections", json={
+        "correction_id": f"CORR-CC-{i}", "sample_code": "S-CONC", "action": "void",
+        "target_event_id": "CC-T1", "operator": "质管员", "reason": "并发纠错测试"})
+    results.append(rr.status_code)
+
+
+threads = [threading.Thread(target=_worker, args=(i,)) for i in range(2)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+check("并发纠错恰好一次 201 一次 409", sorted(results) == [201, 409], str(results))
+c = chain("S-CONC")
+check("链上仅一条纠错记录（失败不改链）", len(c["corrections"]) == 1, str(c["corrections"]))
+check("目标事件仅被作废一次",
+      sum(1 for e in c["timeline"] if e["event_id"] == "CC-T1" and e["status"] == "voided") == 1,
+      str(c["timeline"]))
+check("留痕纠错号与成功纠错一致",
+      [e for e in c["timeline"] if e["event_id"] == "CC-T1"][0]["correction_id"]
+      == c["corrections"][0]["correction_id"], str(c))
+
+# ---------------------------------------------------------------- 19. 纠错与核定的先后关系
+print("19) 核定基于最终有效链；核定后拒绝纠错")
+# 作废入库事件后链不再有效 → 核定被拒
+reg("S-APV", collector="张三", seal="SEAL-AP")
+ev({"event_id": "AP-T1", "event_type": "transfer", "sample_code": "S-APV",
+    "occurred_at": "2026-09-30T02:00:00Z", "transfer_no": "TR-AP",
+    "from_custodian": "张三", "to_custodian": "李四"})
+ev({"event_id": "AP-R1", "event_type": "receive", "sample_code": "S-APV",
+    "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": "TR-AP",
+    "receiver": "李四", "seal_no": "SEAL-AP"})
+ev({"event_id": "AP-S1", "event_type": "storage", "sample_code": "S-APV",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+check("纠错前链 valid", chain("S-APV")["status"] == "valid")
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-AP-1", "sample_code": "S-APV", "action": "void",
+    "target_event_id": "AP-S1", "operator": "质管员", "reason": "入库记录登错样本，作废"})
+check("作废入库事件 201", r.status_code == 201, r.text)
+r = client.post(f"{API}/samples/S-APV/approve", json={"approver": "质量主管"})
+check("作废后核定被拒 422（核定只认最终有效链）", r.status_code == 422, r.text)
+# 纠错后恢复有效的链可正常核定
+r = client.post(f"{API}/samples/S-REPL/approve", json={"approver": "质量主管", "note": "纠错后复核准予入库"})
+check("纠错后 valid 链核定 200", r.status_code == 200, r.text)
+r = client.post(f"{API}/corrections", json={
+    "correction_id": "CORR-LATE-1", "sample_code": "S-REPL", "action": "void",
+    "target_event_id": "RP-T1", "operator": "质管员", "reason": "核定后尝试纠错"})
+check("核定后纠错 409 history_locked",
+      r.status_code == 409 and r.json()["error"]["code"] == "history_locked", r.text)
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 raise SystemExit(1 if FAIL else 0)
