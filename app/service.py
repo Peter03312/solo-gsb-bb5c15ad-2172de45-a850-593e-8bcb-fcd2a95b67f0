@@ -1,4 +1,4 @@
-"""领域服务：登记、事件写入（幂等/冲突）、保管链重算与入库核定。
+"""领域服务：登记、事件写入（幂等/冲突）、保管链重算、事件纠错与入库核定。
 
 核验规则（与 README 一致）：
   * 移交必须由当前保管人发起；移交至签收期间不得再次移交；
@@ -7,6 +7,8 @@
   * 缺签收 / 缺入库 → 待补证；
   * 断链、重复签收、封签不符 → 无效，无效优先于待补证；
   * 乱序补录按发生时间排序后整体重算；
+  * 纠错（作废/替换）仅核定前可提交，只作用于当前有效版本，原记录与纠错关系永久留痕；
+    核验仅纳入有效版本，被替换记录可经链查询追溯；
   * 仅有效链可核定入库；核定后历史冻结。
 """
 import hashlib
@@ -16,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import config
-from .schemas import ApproveIn, EventIn, SampleIn
+from .schemas import ApproveIn, CorrectionIn, EventIn, NewEventIn, SampleIn
 
 LAB_CUSTODIAN = "实验室"
 
@@ -97,8 +99,13 @@ def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.R
 
 # --------------------------------------------------------------------------- 事件写入
 
-def _event_canonical(data: EventIn) -> tuple[dict[str, Any], dict[str, Any]]:
-    """构造参与指纹的规范字典与落库 payload（字段集随事件类型固定）。"""
+def _event_canonical(data: EventIn | NewEventIn, sample_code: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """构造参与指纹的规范字典与落库 payload（字段集随事件类型固定）。
+
+    sample_code 用于纠错替换：NewEventIn 本身不含样本编号（不得跨样本），
+    以纠错单的 sample_code 落库。
+    """
+    code = sample_code or getattr(data, "sample_code")
     occurred = to_utc_iso(data.occurred_at)
     payload: dict[str, Any]
     if data.event_type == "transfer":
@@ -119,7 +126,7 @@ def _event_canonical(data: EventIn) -> tuple[dict[str, Any], dict[str, Any]]:
     canonical: dict[str, Any] = {
         "event_id": data.event_id,
         "event_type": data.event_type,
-        "sample_code": data.sample_code,
+        "sample_code": code,
         "occurred_at": occurred,
         **payload,
     }
@@ -135,12 +142,13 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
     同 event_id + 同内容 → 幂等返回；同 event_id + 异内容 → 409 冲突。
     """
     sample = get_sample_or_404(conn, data.sample_code)
-    ensure_unlocked(sample)
 
     canonical, payload = _event_canonical(data)
     h = _fingerprint(canonical)
     payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
+    # 幂等查重优先于冻结检查：既有规则（同 event_id 同内容 200 / 异内容 409）
+    # 在核定入库后也保持兼容；新增事件才受历史冻结限制。
     existing = conn.execute("SELECT * FROM custody_event WHERE event_id = ?", (data.event_id,)).fetchone()
     if existing is not None:
         if existing["content_hash"] != h:
@@ -159,6 +167,8 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
                 },
             )
         return existing, True
+
+    ensure_unlocked(sample)
 
     from .db import utcnow_iso
 
@@ -181,12 +191,38 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
 
 # --------------------------------------------------------------------------- 保管链重算
 
+def _correction_rows(conn: sqlite3.Connection, sample_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM event_correction WHERE sample_id = ? ORDER BY id ASC",
+        (sample_id,),
+    ).fetchall()
+
+
+def correction_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """纠错留痕的对外结构（原事件与纠错关系永久可查）。"""
+    return {
+        "correction_id": row["correction_id"],
+        "target_event_id": row["target_event_id"],
+        "action": row["action"],
+        "operator": row["operator"],
+        "reason": row["reason"],
+        "new_event_id": row["new_event_id"],
+        "created_at": row["created_at"],
+    }
+
+
 def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
-    """按发生时间重算该样本的完整证据链，输出结论。"""
-    events = conn.execute(
+    """按发生时间重算该样本的完整证据链，输出结论。
+
+    仅纳入当前有效版本（superseded_by IS NULL）；被作废/替换的事件不参与核验，
+    其内容经 superseded_events 与 corrections 永久留痕、可追溯。
+    """
+    all_rows = conn.execute(
         "SELECT * FROM custody_event WHERE sample_id = ? ORDER BY occurred_at ASC, id ASC",
         (sample["id"],),
     ).fetchall()
+    events = [e for e in all_rows if e["superseded_by"] is None]
+    superseded_rows = [e for e in all_rows if e["superseded_by"] is not None]
 
     current = sample["collector"]                       # 当前保管人（初始为采集人）
     open_transfer: dict[str, Any] | None = None         # 在途移交（已移交未签收）
@@ -216,6 +252,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                 "occurred_at": ev["occurred_at"],
                 "recorded_at": ev["created_at"],
                 "payload": p,
+                "replaces_event_id": ev["replaces_event_id"],
             }
         )
 
@@ -326,6 +363,21 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
         status = "valid"
         reasons = [f"保管链完整：采集 {sample['collector']} 至当前保管人 {current}，封签一致，已入库"]
 
+    # 被作废/替换的原始事件（按发生时间排列），仅用于追溯，不参与上面的核验
+    superseded_events = [
+        {
+            "event_id": ev["event_id"],
+            "event_type": ev["event_type"],
+            "occurred_at": ev["occurred_at"],
+            "recorded_at": ev["created_at"],
+            "payload": json.loads(ev["payload_json"]),
+            "superseded_by": ev["superseded_by"],
+            "replaces_event_id": ev["replaces_event_id"],
+        }
+        for ev in superseded_rows
+    ]
+    corrections = [correction_to_dict(r) for r in _correction_rows(conn, sample["id"])]
+
     return {
         "sample_code": sample["sample_code"],
         "status": status,
@@ -336,7 +388,166 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
         "approved_storage_at": sample["approved_storage_at"],
         "event_count": len(events),
         "timeline": timeline,
+        "corrections": corrections,
+        "superseded_events": superseded_events,
     }
+
+
+# --------------------------------------------------------------------------- 事件纠错（作废 / 替换）
+
+def _correction_fingerprint(data: CorrectionIn, new_canonical: dict[str, Any] | None) -> str:
+    obj = {
+        "correction_id": data.correction_id,
+        "sample_code": data.sample_code,
+        "target_event_id": data.target_event_id,
+        "action": data.action,
+        "operator": data.operator,
+        "reason": data.reason,
+    }
+    if new_canonical is not None:
+        obj["new_event"] = new_canonical
+    return _fingerprint(obj)
+
+
+def _get_correction(conn: sqlite3.Connection, correction_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM event_correction WHERE correction_id = ?", (correction_id,)
+    ).fetchone()
+
+
+def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dict[str, Any], bool]:
+    """提交作废/替换纠错。返回 (纠错结果, 是否幂等重试)。
+
+    规则：
+      * 仅核定入库前可纠错；纠错不得跨样本；
+      * 只能针对当前有效版本（已被作废/替换的事件再次纠错 → 409，失败不改链）；
+      * replace 必须给完整新事件内容且新事件号未被占用（含已留痕的旧号）；
+      * 同 correction_id 同内容 → 幂等返回 200；异内容 → 409；
+      * 并发针对同一有效版本只允许一次成功（行级条件更新守卫，失败回滚）。
+    """
+    from .db import utcnow_iso
+
+    sample = get_sample_or_404(conn, data.sample_code)
+
+    new_canonical: dict[str, Any] | None = None
+    new_payload_json: str | None = None
+    new_hash: str | None = None
+    if data.new_event is not None:
+        new_canonical, new_payload = _event_canonical(data.new_event, sample_code=data.sample_code)
+        new_payload_json = json.dumps(new_payload, ensure_ascii=False, separators=(",", ":"))
+        new_hash = _fingerprint(new_canonical)
+
+    request_hash = _correction_fingerprint(data, new_canonical)
+
+    # 1) 同纠错号：同内容幂等 / 异内容冲突（与既有事件上报语义一致）
+    existing = _get_correction(conn, data.correction_id)
+    if existing is not None:
+        if existing["request_hash"] != request_hash:
+            raise DomainError(
+                409,
+                "correction_conflict",
+                f"纠错号 {data.correction_id} 已使用但提交内容不一致（同纠错号异内容冲突）",
+                {"correction_id": data.correction_id,
+                 "existing_request_hash": existing["request_hash"],
+                 "incoming_request_hash": request_hash},
+            )
+        return _correction_result(conn, sample, existing), True
+
+    # 2) 核定入库后拒绝纠错
+    ensure_unlocked(sample)
+
+    # 3) 目标事件必须存在、属于该样本、且仍是当前有效版本
+    target = conn.execute(
+        "SELECT * FROM custody_event WHERE event_id = ?", (data.target_event_id,)
+    ).fetchone()
+    if target is None:
+        raise DomainError(404, "event_not_found", f"目标事件不存在: {data.target_event_id}")
+    if target["sample_id"] != sample["id"]:
+        raise DomainError(
+            409,
+            "correction_cross_sample",
+            f"纠错不得跨样本：事件 {data.target_event_id} 不属于样本 {data.sample_code}",
+            {"target_event_id": data.target_event_id,
+               "target_sample_id": target["sample_id"],
+               "request_sample_code": data.sample_code},
+        )
+    if target["superseded_by"] is not None:
+        raise DomainError(
+            409,
+            "event_not_effective",
+            f"事件 {data.target_event_id} 已被纠错 {target['superseded_by']} 作废/替换，"
+            "仅可针对当前有效版本纠错",
+            {"target_event_id": data.target_event_id, "superseded_by": target["superseded_by"]},
+        )
+
+    # 4) 替换：新事件号必须未被占用（有效版本与历史留痕共用全局唯一事件号）
+    new_row_id: int | None = None
+    if data.action == "replace":
+        occupied = conn.execute(
+            "SELECT 1 FROM custody_event WHERE event_id = ?", (data.new_event.event_id,)
+        ).fetchone()
+        if occupied is not None:
+            raise DomainError(
+                409,
+                "new_event_id_occupied",
+                f"新事件号 {data.new_event.event_id} 已被占用，替换须使用未占用的新事件号",
+                {"new_event_id": data.new_event.event_id},
+            )
+
+    # 5) 原子生效：条件更新仅命中仍为有效版本的目标行。
+    #    本事务在 IMMEDIATE 写锁内，其他纠错/核定无法穿插；若目标行已被并发事务
+    #    抢先纠错（本事务持锁后重读必可见），rowcount=0，整体回滚，链不变。
+    cur = conn.execute(
+        "UPDATE custody_event SET superseded_by = ? WHERE id = ? AND superseded_by IS NULL",
+        (data.correction_id, target["id"]),
+    )
+    if cur.rowcount == 0:
+        raise DomainError(
+            409,
+            "event_not_effective",
+            f"事件 {data.target_event_id} 已被并发纠错，同一有效版本仅允许一次纠错成功",
+            {"target_event_id": data.target_event_id},
+        )
+
+    if data.action == "replace":
+        ins = conn.execute(
+            "INSERT INTO custody_event"
+            " (sample_id, event_id, event_type, occurred_at, payload_json, content_hash,"
+            "  created_at, superseded_by, replaces_event_id)"
+            " VALUES (?,?,?,?,?,?,?,NULL,?)",
+            (sample["id"], data.new_event.event_id, data.new_event.event_type,
+             new_canonical["occurred_at"], new_payload_json, new_hash,
+             utcnow_iso(), data.target_event_id),
+        )
+        new_row_id = ins.lastrowid
+
+    corr_cur = conn.execute(
+        "INSERT INTO event_correction"
+        " (correction_id, sample_id, target_event_id, action, operator, reason,"
+        "  new_event_id, new_event_row_id, request_hash, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (data.correction_id, sample["id"], data.target_event_id, data.action,
+         data.operator, data.reason,
+         data.new_event.event_id if data.new_event else None, new_row_id,
+         request_hash, utcnow_iso()),
+    )
+    corr_row = conn.execute(
+        "SELECT * FROM event_correction WHERE id = ?", (corr_cur.lastrowid,)
+    ).fetchone()
+    return _correction_result(conn, sample, corr_row), False
+
+
+def _correction_result(
+    conn: sqlite3.Connection, sample: sqlite3.Row, corr_row: sqlite3.Row
+) -> dict[str, Any]:
+    """纠错提交后的响应体（含按最终有效链重算的结论、原因、当前保管人）。"""
+    result = evaluate(conn, sample)
+    return {"correction": correction_to_dict(corr_row), "evaluation": result}
+
+
+def list_corrections(conn: sqlite3.Connection, sample_code: str) -> list[dict[str, Any]]:
+    sample = get_sample_or_404(conn, sample_code)
+    return [correction_to_dict(r) for r in _correction_rows(conn, sample["id"])]
 
 
 # --------------------------------------------------------------------------- 入库核定

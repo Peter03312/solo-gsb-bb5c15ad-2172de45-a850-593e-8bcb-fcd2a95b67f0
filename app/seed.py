@@ -63,7 +63,7 @@ def seed_demo() -> dict[str, int]:
 
     inserted_samples = 0
     inserted_events = 0
-    with db_session() as conn:
+    with db_session(immediate=True) as conn:
         for s in samples:
             _, idempotent = register_sample(conn, s)
             inserted_samples += int(not idempotent)

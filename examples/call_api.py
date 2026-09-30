@@ -106,9 +106,66 @@ def main() -> None:
     for e in r["timeline"]:
         print(" ", e["occurred_at"], e["event_type"], e["event_id"])
 
-    # 9) 核定入库（仅 valid 可核定；核定后冻结）
+    # 8.1) 纠错（替换）：用新事件号替换封签检查，结论按仅有效版本重算
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-C-{run_id}",
+        "sample_code": code,
+        "target_event_id": f"API-EVT-C1-{run_id}",
+        "action": "replace",
+        "operator": "质控员",
+        "reason": "示例：封签检查记录需补备注，整体替换",
+        "new_event": {
+            "event_id": f"API-EVT-C2-{run_id}",
+            "event_type": "seal_check",
+            "occurred_at": "2026-09-30T04:30:00Z",
+            "checked_seal_no": "SEAL-DEMO-1",
+            "seal_intact": True,
+            "note": "纠错替换：复核无误",
+        },
+    })
+    show("纠错-替换（同纠错号同内容重试幂等）", s, r, "correction")
+    print("  替换后结论:", r["evaluation"]["status"], "| 保管人:", r["evaluation"]["current_custodian"])
+
+    # 8.2) 同纠错号同内容重试 → 200 幂等；异内容 → 409（此处仅演示幂等）
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-C-{run_id}",
+        "sample_code": code,
+        "target_event_id": f"API-EVT-C1-{run_id}",
+        "action": "replace",
+        "operator": "质控员",
+        "reason": "示例：封签检查记录需补备注，整体替换",
+        "new_event": {
+            "event_id": f"API-EVT-C2-{run_id}",
+            "event_type": "seal_check",
+            "occurred_at": "2026-09-30T04:30:00Z",
+            "checked_seal_no": "SEAL-DEMO-1",
+            "seal_intact": True,
+            "note": "纠错替换：复核无误",
+        },
+    })
+    show("同纠错号同内容重试", s, r, "correction")
+
+    # 8.3) 链查询可追溯被替换记录与纠错关系
+    s, r = call("GET", f"/samples/{code}/chain")
+    print(f"\n--- 纠错后证据链 [HTTP {s}] ---")
+    print("有效时间线:", [e["event_id"] for e in r["timeline"]])
+    print("被替换记录:", [e["event_id"] for e in r["superseded_events"]])
+    print("纠错留痕:", [(c["correction_id"], c["action"], c["new_event_id"]) for c in r["corrections"]])
+
+    # 9) 核定入库（仅 valid 可核定；核定后冻结，纠错也一并拒绝）
     s, r = call("POST", f"/samples/{code}/approve", {"approver": "质量主管", "note": "准予入库"})
     show("核定入库", s, r, "approval")
+
+    # 9.1) 核定后纠错 → 409 history_locked
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-LATE-{run_id}",
+        "sample_code": code,
+        "target_event_id": f"API-EVT-T1-{run_id}",
+        "action": "void",
+        "operator": "质控员",
+        "reason": "核定后试探作废",
+    })
+    show("核定后纠错（拒绝）", s, r)
 
     # 10) 核定后再写事件 → 409 history_locked
     s, r = call("POST", "/events", {
@@ -116,6 +173,36 @@ def main() -> None:
         "occurred_at": "2026-09-30T06:00:00Z", "checked_seal_no": "SEAL-DEMO-1",
     })
     show("核定后改写（拒绝）", s, r)
+
+    # 11) 作废演示（独立样本）：作废后核验只纳入有效版本，结论即时重算
+    code2 = f"API-VOID-{run_id}"
+    call("POST", "/samples", {
+        "sample_code": code2,
+        "collected_at": "2026-09-30T01:00:00Z",
+        "collector": "王采集",
+        "seal_no": "SEAL-DEMO-2",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT2-T1-{run_id}", "event_type": "transfer", "sample_code": code2,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": "TR-DEMO-2", "from_custodian": "王采集", "to_custodian": "李运输",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-EVT2-R1-{run_id}", "event_type": "receive", "sample_code": code2,
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "transfer_no": "TR-DEMO-2", "receiver": "李运输", "seal_no": "WRONG-SEAL",
+    })
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-V-{run_id}",
+        "sample_code": code2,
+        "target_event_id": f"API-EVT2-R1-{run_id}",
+        "action": "void",
+        "operator": "质控员",
+        "reason": "误报，作废封签号错误的签收",
+    })
+    show("纠错-作废（原记录留痕、核验剔除）", s, r, "evaluation", "status")
+    s, r = call("GET", f"/samples/{code2}/corrections")
+    show("纠错审计查询", s, r)
 
 
 if __name__ == "__main__":

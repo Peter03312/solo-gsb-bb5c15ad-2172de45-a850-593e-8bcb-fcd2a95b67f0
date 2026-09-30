@@ -21,18 +21,48 @@ CREATE TABLE IF NOT EXISTS sample (
 );
 
 CREATE TABLE IF NOT EXISTS custody_event (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    sample_id     INTEGER NOT NULL REFERENCES sample(id),
-    event_id      TEXT NOT NULL UNIQUE,                  -- 全局唯一事件号
-    event_type    TEXT NOT NULL CHECK (event_type IN ('transfer','receive','seal_check','storage')),
-    occurred_at   TEXT NOT NULL,                         -- 事件发生时间（UTC ISO8601）
-    payload_json  TEXT NOT NULL,                         -- 类型相关字段
-    content_hash  TEXT NOT NULL,                        -- 事件内容指纹（同事件号重试比对）
-    created_at    TEXT NOT NULL
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id          INTEGER NOT NULL REFERENCES sample(id),
+    event_id           TEXT NOT NULL UNIQUE,             -- 全局唯一事件号
+    event_type         TEXT NOT NULL CHECK (event_type IN ('transfer','receive','seal_check','storage')),
+    occurred_at        TEXT NOT NULL,                    -- 事件发生时间（UTC ISO8601）
+    payload_json       TEXT NOT NULL,                    -- 类型相关字段
+    content_hash       TEXT NOT NULL,                    -- 事件内容指纹（同事件号重试比对）
+    created_at         TEXT NOT NULL,
+    superseded_by      TEXT,                             -- 被哪条纠错作废/替换（NULL=当前有效版本）
+    replaces_event_id  TEXT                              -- 替换产生的新事件：指向被替换的原事件号
+);
+
+CREATE TABLE IF NOT EXISTS event_correction (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    correction_id     TEXT NOT NULL UNIQUE,              -- 全局唯一纠错号
+    sample_id         INTEGER NOT NULL REFERENCES sample(id),
+    target_event_id   TEXT NOT NULL,                     -- 被纠错的事件号（提交时为当前有效版本）
+    action            TEXT NOT NULL CHECK (action IN ('void','replace')),
+    operator          TEXT NOT NULL,                     -- 纠错操作人
+    reason            TEXT NOT NULL,                     -- 纠错原因
+    new_event_id      TEXT,                              -- replace 时的新事件号（void 为 NULL）
+    new_event_row_id  INTEGER REFERENCES custody_event(id), -- replace 时新事件行
+    request_hash      TEXT NOT NULL,                     -- 纠错请求指纹（同纠错号幂等/冲突判定）
+    created_at        TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 """
+
+# 依赖纠错新列的索引（须在旧库补列迁移完成后再创建）
+POST_MIGRATION_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_event_effective ON custody_event(sample_id, superseded_by, occurred_at)",
+    "CREATE INDEX IF NOT EXISTS idx_correction_sample ON event_correction(sample_id, id)",
+]
+
+# 旧库（本轮纠错能力之前的版本）增量补列
+_MIGRATION_COLUMNS = {
+    "custody_event": [
+        ("superseded_by", "TEXT"),
+        ("replaces_event_id", "TEXT"),
+    ],
+}
 
 
 def utcnow_iso() -> str:
@@ -51,8 +81,16 @@ def get_connection() -> sqlite3.Connection:
 
 
 @contextmanager
-def db_session(commit: bool = True) -> Iterator[sqlite3.Connection]:
+def db_session(commit: bool = True, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """事务上下文。
+
+    immediate=True 时以 BEGIN IMMEDIATE 开启，事务一开始即持有写锁，
+    使所有写操作（事件上报 / 纠错 / 核定）在 SQLite 层严格串行：
+    纠错与核定并发时后到者必然看到先到者已提交的最终状态。
+    """
     conn = get_connection()
+    if immediate:
+        conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
         if commit:
@@ -65,9 +103,16 @@ def db_session(commit: bool = True) -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    """进程启动时建表（幂等）。"""
+    """进程启动时建表（幂等），并对旧库执行增量迁移。"""
     with db_session() as conn:
         conn.executescript(SCHEMA)
+        for table, columns in _MIGRATION_COLUMNS.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        for stmt in POST_MIGRATION_INDEXES:
+            conn.execute(stmt)
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:

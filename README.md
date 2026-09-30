@@ -1,6 +1,6 @@
 # 样本交接链核验服务（Chain of Custody）
 
-面向环境检测机构的样本保管链核验服务：登记样本采集信息，接收**移交 / 签收 / 封签检查 / 实验室入库**四类带唯一事件号的事件，自动按发生时间重算证据链，输出**当前保管人**与 **有效（valid）/ 待补证（pending）/ 无效（invalid）**结论及原因；仅有效链可核定入库，核定后历史冻结。
+面向环境检测机构的样本保管链核验服务：登记样本采集信息，接收**移交 / 签收 / 封签检查 / 实验室入库**四类带唯一事件号的事件，自动按发生时间重算证据链，输出**当前保管人**与 **有效（valid）/ 待补证（pending）/ 无效（invalid）**结论及原因；核定入库前支持对当前有效事件提交**作废 / 替换纠错**（永久留痕、仅有效版本参与核验）；仅有效链可核定入库，核定后历史冻结。
 
 技术栈：**Python 3.11 + FastAPI + SQLite（标准库 sqlite3）**，无外部服务依赖。
 
@@ -20,7 +20,9 @@
 | 保管人断链 | 移交人不是当前保管人 / 签收无对应在途移交 → **无效** |
 | 结论优先级 | **无效优先**：同时存在无效原因与待补证事项时，结论为无效（原因中附注待补证事项） |
 | 乱序补录 | 事件可任意顺序上报，每次查询/核定都按 `occurred_at`（发生时间，非录入时间）整体重算 |
-| 事件幂等 | 同一 `event_id` + 同内容（SHA-256 指纹）重试 → 幂等返回 HTTP 200；同 `event_id` 异内容 → HTTP 409 冲突 |
+| 事件幂等 | 同一 `event_id` + 同内容（SHA-256 指纹）重试 → 幂等返回 HTTP 200；同 `event_id` 异内容 → HTTP 409 冲突（核定后亦保持此兼容行为） |
+| 核定前纠错 | 核定前可按样本编号 + 当前有效事件号提交**作废（void）/替换（replace）**，附全局唯一纠错号、操作人、原因；替换须给完整新事件内容与**未占用**的新事件号。原事件与纠错关系永久留痕，核验仅纳入有效版本并按发生时间重算结论/原因/当前保管人；被替换记录可经链查询追溯。纠错**不得跨样本**；同纠错号同内容重试幂等（200）、异内容冲突（409）；并发针对同一有效版本仅一次成功，失败不改链。核定入库后拒绝纠错 |
+| 纠错与核定并发 | 写事务以 `BEGIN IMMEDIATE` 串行：先提交者生效，后到者看到其已提交结果——作废先提交则核定基于最终有效链（非 valid 则 422），核定先提交则纠错被 `history_locked` 拒绝 |
 | 入库核定 | 仅 `valid` 可核定；核定后该样本登记与事件全部**拒绝改写**（HTTP 409），重复核定幂等 |
 
 > 说明：任何事件发生时间早于样本采集时间，直接记为无效（采集前不可能发生保管动作）。
@@ -187,10 +189,23 @@ curl http://localhost:8080/api/v1/samples/S-001/chain
   "pending_transfer": null,
   "has_storage": true,
   "timeline": [
-    {"event_id": "EVT-T1", "event_type": "transfer", "occurred_at": "...", "recorded_at": "...", "payload": {"...": "..."}}
+    {"event_id": "EVT-T1", "event_type": "transfer", "occurred_at": "...", "recorded_at": "...",
+     "payload": {"...": "..."}, "replaces_event_id": null}
+  ],
+  "corrections": [
+    {"correction_id": "FIX-1", "target_event_id": "EVT-C1", "action": "replace",
+     "operator": "质控员", "reason": "……", "new_event_id": "EVT-C2", "created_at": "..."}
+  ],
+  "superseded_events": [
+    {"event_id": "EVT-C1", "event_type": "seal_check", "occurred_at": "...", "payload": {"...": "..."},
+     "superseded_by": "FIX-1", "replaces_event_id": null}
   ]
 }
 ```
+
+- `timeline` 仅含**当前有效版本**事件（`replaces_event_id` 标记该事件是否由替换产生、指向原事件号）；
+- `superseded_events` 为被作废/替换的原始事件，仅用于追溯，不参与核验；
+- `corrections` 为该样本全部纠错留痕（永久保留，核定后仍可查）。
 
 ### 5.4 入库核定
 
@@ -203,6 +218,63 @@ curl -X POST http://localhost:8080/api/v1/samples/S-001/approve \
 
 - `valid` → `200` 核定成功并冻结；`pending`/`invalid` → `422 approval_rejected`（响应体带回完整核验结果）。
 - 核定后再上报事件或改写登记 → `409 history_locked`；重复核定幂等返回。
+- 核定与纠错并发时，核定只可能基于**最终已提交的有效链**判定。
+
+### 5.5 事件纠错（核定前：作废 / 替换）
+
+`POST /api/v1/corrections`
+
+公共字段：`correction_id`（全局唯一纠错号）、`sample_code`、`target_event_id`（被纠错的**当前有效**事件号）、`action`（`void` / `replace`）、`operator`、`reason`；`replace` 时必须提供 `new_event`（字段集与 5.2 事件完全一致，但**不含 `sample_code`**——纠错不得跨样本）。
+
+```bash
+# 作废：错误签收作废，核验随即只按剩余有效版本重算
+curl -X POST http://localhost:8080/api/v1/corrections -H 'Content-Type: application/json' -d '{
+  "correction_id":"FIX-0001","sample_code":"S-001","target_event_id":"EVT-R1",
+  "action":"void","operator":"质控员","reason":"封签号录入错误，作废重报"}'
+
+# 替换：给出完整新事件内容与未占用的新事件号
+curl -X POST http://localhost:8080/api/v1/corrections -H 'Content-Type: application/json' -d '{
+  "correction_id":"FIX-0002","sample_code":"S-001","target_event_id":"EVT-C1",
+  "action":"replace","operator":"质控员","reason":"检查时扫码识别错误，整体替换",
+  "new_event":{
+    "event_id":"EVT-C2","event_type":"seal_check",
+    "occurred_at":"2026-09-30T04:30:00Z",
+    "checked_seal_no":"SEAL-001","seal_intact":true}}'
+```
+
+响应（`201` 新纠错；`200` 同纠错号同内容幂等重试）：
+
+```json
+{
+  "correction": {
+    "correction_id": "FIX-0002", "target_event_id": "EVT-C1", "action": "replace",
+    "operator": "质控员", "reason": "检查时扫码识别错误，整体替换",
+    "new_event_id": "EVT-C2", "created_at": "2026-09-30T05:10:00Z"
+  },
+  "evaluation": {"status": "valid", "reasons": ["..."], "current_custodian": "实验室", "...": "..."}
+}
+```
+
+规则与语义：
+
+| 规则 | 行为 |
+|---|---|
+| 准入 | 仅核定入库前可纠错；目标必须属于该样本且仍是当前有效版本 |
+| 作废 `void` | 原事件标记失效（行不删除），不得携带 `new_event` |
+| 替换 `replace` | 原事件标记失效，写入完整新事件；新事件号必须全局未占用（旧号永久留痕不可复用） |
+| 重算 | 仅有效版本按 `occurred_at` 重算结论、原因、当前保管人；可连续替换（替换产生的新版本仍可再被纠错） |
+| 幂等/冲突 | 同 `correction_id` 同内容重试 → `200`；异内容（含动作不同）→ `409 correction_conflict` |
+| 并发 | 针对同一有效版本仅一次成功：落败方 `409 event_not_effective` 且事务回滚，链不变 |
+| 核定后 | `409 history_locked`（包括与核定并发落败的纠错） |
+
+纠错审计查询：
+
+```bash
+curl http://localhost:8080/api/v1/samples/S-001/corrections
+# {"sample_code":"S-001","total":2,"items":[{"correction_id":"FIX-0002", ...}]}
+```
+
+被替换记录通过 `GET /api/v1/samples/{sample_code}/chain` 的 `superseded_events` / `corrections` 字段追溯（见 5.3）。
 
 ### 错误响应统一格式
 
@@ -212,9 +284,13 @@ curl -X POST http://localhost:8080/api/v1/samples/S-001/approve \
 
 | HTTP | code | 触发 |
 |---|---|---|
-| 404 | `sample_not_found` | 样本不存在 |
+| 404 | `sample_not_found` / `event_not_found` | 样本不存在 / 纠错目标事件不存在 |
 | 409 | `sample_conflict` / `event_conflict` | 同编号异内容 / 同事件号异内容 |
-| 409 | `history_locked` | 已核定入库后改写历史 |
+| 409 | `history_locked` | 已核定入库后改写历史或纠错 |
+| 409 | `correction_conflict` | 同纠错号异内容（含动作 void↔replace 不一致） |
+| 409 | `correction_cross_sample` | 纠错目标事件不属于提交的样本（禁止跨样本） |
+| 409 | `event_not_effective` | 目标事件已被作废/替换，或并发下被抢先纠错（非当前有效版本） |
+| 409 | `new_event_id_occupied` | 替换所用新事件号已被占用 |
 | 422 | `approval_rejected` | 非有效链尝试核定（或 Pydantic 字段校验失败） |
 
 ---
@@ -227,17 +303,19 @@ curl -X POST http://localhost:8080/api/v1/samples/S-001/approve \
 python examples/call_api.py
 ```
 
-脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → 核定 → 核定后改写被拒。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
+脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
 
 ---
 
 ## 七、自测
 
 ```bash
-python -m tests.test_chain
+python -m tests.test_chain          # 既有规则：42 项断言
+python -m tests.test_corrections    # 本轮纠错：62 项断言（含并发）
 ```
 
-通过 FastAPI TestClient 覆盖 14 类场景共 42 项断言：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
+- `test_chain` 覆盖 14 类场景：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
+- `test_corrections` 覆盖：作废后仅有效版本重算（结论/原因/保管人）、替换生效与多跳替换、原事件与纠错关系留痕及链追溯、审计查询、同纠错号幂等/异内容冲突、跨样本拒绝、非有效版本拒绝、新事件号占用、replace/void 载荷校验、核定后拒绝纠错、同事件号 200/409 兼容、同有效版本并发仅一次成功、纠错与核定并发两种合法结局（可重复运行）。
 
 ---
 
@@ -247,13 +325,14 @@ python -m tests.test_chain
 .
 ├── app/
 │   ├── main.py       # FastAPI 路由、异常映射、启动初始化
-│   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、核定冻结
-│   ├── schemas.py    # 请求模型与按事件类型的必填校验
-│   ├── db.py         # SQLite 连接、建表、事务
+│   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、纠错（作废/替换）、核定冻结
+│   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）按类型必填校验
+│   ├── db.py         # SQLite 连接、建表与旧库迁移、IMMEDIATE 事务
 │   ├── seed.py       # 演示数据初始化（幂等）
 │   └── config.py     # 环境变量配置
-├── examples/call_api.py   # 零依赖调用示例
-├── tests/test_chain.py    # 端到端自测（42 项断言）
+├── examples/call_api.py   # 零依赖调用示例（含纠错全流程）
+├── tests/test_chain.py    # 既有规则端到端自测（42 项断言）
+├── tests/test_corrections.py  # 纠错端到端自测（62 项断言，含并发）
 ├── entrypoint.sh     # 容器入口：建表 → 演示数据 → 启动
 ├── Dockerfile
 ├── docker-compose.yml
